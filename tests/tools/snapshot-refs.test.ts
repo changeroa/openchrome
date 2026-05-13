@@ -284,6 +284,37 @@ describe('Snapshot Refs (#831)', () => {
       expect(result.error?.code).toBe('STALE_REF');
       expect(result.error?.ref_id).toBe(refId);
     });
+
+
+    test('ref checkbox updates checked state without text typing or pre-click', async () => {
+      const handler = await getFillFormHandler();
+      const page = (await mockSessionManager.getPage(testSessionId, testTargetId))!;
+      const refId = mockRefIdManager.generateRef(testSessionId, testTargetId, 4243, 'checkbox', 'Accept', 'input');
+
+      mockSessionManager.mockCDPClient.send
+        .mockResolvedValueOnce({}) // DOM.scrollIntoViewIfNeeded
+        .mockResolvedValueOnce({ object: { objectId: 'checkbox-object' } }) // DOM.resolveNode
+        .mockResolvedValueOnce({ result: { value: { handled: true, success: true, kind: 'checkbox' } } }); // Runtime.callFunctionOn
+
+      const result = await handler(testSessionId, {
+        tabId: testTargetId,
+        refs: { [refId]: true },
+      }) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+
+      expect(result.isError).toBe(false);
+      expect(result.content[0].text).toContain('Filled 1 field');
+      expect(page.mouse.click).not.toHaveBeenCalled();
+      expect(page.keyboard.type).not.toHaveBeenCalled();
+      expect(mockSessionManager.mockCDPClient.send).toHaveBeenCalledWith(
+        page,
+        'Runtime.callFunctionOn',
+        expect.objectContaining({
+          objectId: 'checkbox-object',
+          arguments: [{ value: true }],
+          returnByValue: true,
+        }),
+      );
+    });
   });
 
   // ─── find vision fallback default-off ─────────────────────────────────

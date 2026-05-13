@@ -185,6 +185,79 @@ const handler: ToolHandler = async (
           });
           await new Promise(resolve => setTimeout(resolve, DEFAULT_DOM_SETTLE_DELAY_MS));
 
+          const { object } = await cdpClient.send<{ object?: { objectId?: string } }>(
+            page,
+            'DOM.resolveNode',
+            { backendNodeId: entry.backendDOMNodeId },
+          );
+          if (!object?.objectId) {
+            return { submitted, loginResult: null, submitErrored: false, staleRef: refKey };
+          }
+
+          const { result: refControlResult } = await cdpClient.send<{
+            result: { value?: { handled: boolean; success: boolean; kind?: string; error?: string } };
+          }>(page, 'Runtime.callFunctionOn', {
+            objectId: object.objectId,
+            functionDeclaration: `
+              function(newValue) {
+                try {
+                  const el = this;
+                  const tag = (el.tagName || '').toLowerCase();
+                  const type = (el.type || '').toLowerCase();
+                  if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+                    const shouldCheck =
+                      newValue === true || newValue === 'true' || newValue === '1';
+                    if (el.checked !== shouldCheck) {
+                      const checkedSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype,
+                        'checked',
+                      )?.set;
+                      if (checkedSetter) checkedSetter.call(el, shouldCheck);
+                      else el.checked = shouldCheck;
+                      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                    }
+                    return { handled: true, success: true, kind: type };
+                  }
+                  if (tag === 'select') {
+                    const desired = String(newValue);
+                    const option = Array.from(el.options).find((candidate) =>
+                      candidate.value === desired || candidate.textContent?.trim() === desired
+                    );
+                    if (!option) {
+                      return { handled: true, success: false, kind: 'select', error: 'Option not found: ' + desired };
+                    }
+                    const selectSetter = Object.getOwnPropertyDescriptor(
+                      window.HTMLSelectElement.prototype,
+                      'value',
+                    )?.set;
+                    if (selectSetter) selectSetter.call(el, option.value);
+                    else el.value = option.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                    return { handled: true, success: true, kind: 'select' };
+                  }
+                  return { handled: false, success: true, kind: type || tag || 'text' };
+                } catch (error) {
+                  return { handled: true, success: false, error: error instanceof Error ? error.message : String(error) };
+                }
+              }
+            `,
+            arguments: [{ value: refValue }],
+            returnByValue: true,
+          });
+          const refControl = refControlResult.value;
+          if (refControl?.handled) {
+            if (!refControl.success) {
+              errors.push(`Failed to fill ref ${refKey}: ${refControl.error || 'control update failed'}`);
+              continue;
+            }
+            invalidateAXCache(getTargetId(page.target()));
+            const stringValue = String(refValue);
+            filledFields.push(`${refKey}: "${stringValue.slice(0, 20)}${stringValue.length > 20 ? '...' : ''}" [via ref]`);
+            continue;
+          }
+
           const { model } = await cdpClient.send<{ model: { content: number[] } }>(
             page, 'DOM.getBoxModel', { backendNodeId: entry.backendDOMNodeId }
           );
