@@ -228,7 +228,7 @@ describe('DOM Serializer', () => {
     expect(line).not.toContain('data-custom');
   });
 
-  test('escapes quotes and special characters in kept attribute values', async () => {
+  test('escapes quotes and ampersands in kept attribute values', async () => {
     const docWithSpecialAttrs = {
       nodeId: 1, backendNodeId: 1, nodeType: 9, nodeName: '#document', localName: '',
       children: [{
@@ -239,6 +239,7 @@ describe('DOM Serializer', () => {
           attributes: [
             'value', 'Tom & "Jerry" <Cartoon> > Show',
             'placeholder', 'Use "quotes" & <angle> brackets',
+            'title', "Bob's <special> label",
           ],
           children: [],
         }],
@@ -254,7 +255,35 @@ describe('DOM Serializer', () => {
     expect(line).toBeDefined();
     expect(line).toContain('value="Tom &amp; &quot;Jerry&quot; &lt;Cartoon&gt; &gt; Show"');
     expect(line).toContain('placeholder="Use &quot;quotes&quot; &amp; &lt;angle&gt; brackets"');
+    expect(line).toContain('title="Bob&apos;s &lt;special&gt; label"');
     expect(line).not.toContain('Tom & "Jerry" <Cartoon> > Show');
+  });
+
+  test('escapes attribute values that could inject fake attributes', async () => {
+    const docWithInjectedAttrText = {
+      nodeId: 1, backendNodeId: 1, nodeType: 9, nodeName: '#document', localName: '',
+      children: [{
+        nodeId: 2, backendNodeId: 2, nodeType: 1, nodeName: 'BODY', localName: 'body',
+        attributes: [],
+        children: [{
+          nodeId: 3, backendNodeId: 302, nodeType: 1, nodeName: 'BUTTON', localName: 'button',
+          attributes: [
+            'aria-label', 'Save" data-testid="fake & confirm',
+          ],
+          children: [],
+        }],
+      }],
+    };
+
+    const page = createMockPageForDOM();
+    const cdpClient = createMockCDPClientForDOM(docWithInjectedAttrText);
+
+    const result = await serializeDOM(page as never, cdpClient as never, { includePageStats: false });
+    const line = result.content.split('\n').find(l => l.includes('<button '));
+
+    expect(line).toBeDefined();
+    expect(line).toContain('aria-label="Save&quot; data-testid=&quot;fake &amp; confirm"');
+    expect(line).not.toContain('data-testid="fake');
   });
 
   // 5. Text content
