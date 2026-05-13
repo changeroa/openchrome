@@ -6,8 +6,8 @@ import { MCPServer } from '../mcp-server';
 import { MCPToolDefinition, MCPResult, ToolHandler, ToolContext } from '../types/mcp';
 import { getSessionManager } from '../session-manager';
 import { withTimeout } from '../utils/with-timeout';
-import { waitForPageReady, PageReadyResult } from '../utils/page-ready-state';
 import { getDomainMemory, extractDomainFromUrl } from '../memory/domain-memory';
+import { recordQueryDebug } from '../query-debug/store';
 import {
   validateSchema,
   validateAndCoerce,
@@ -16,6 +16,9 @@ import {
   buildOpenGraphExtractor,
   buildCssHeuristicExtractor,
   buildMultipleItemExtractor,
+  buildExtractionPlan,
+  buildExtractionQueryPlan,
+  ExtractionQueryParseError,
 } from '../extraction';
 import type { ExtractionSchema, SchemaProperty } from '../extraction';
 
@@ -36,6 +39,17 @@ const definition: MCPToolDefinition = {
           'JSON Schema defining output structure. ' +
           'Example: { "type": "object", "properties": { "title": { "type": "string" }, "price": { "type": "number" } } }',
       },
+      query: {
+        type: 'string',
+        description:
+          'OpenChrome local extraction query. Example: { products[] { product_name product_price(number) product_url(url) } }. ' +
+          'Mutually exclusive with schema; no external AgentQL/API calls are made.',
+      },
+      mode: {
+        type: 'string',
+        enum: ['fast'],
+        description: 'Extraction mode placeholder. V1 supports only fast/local extraction; standard mode is tracked separately in #989.',
+      },
       instruction: {
         type: 'string',
         description: 'Optional natural language hint (e.g., "product details")',
@@ -52,16 +66,8 @@ const definition: MCPToolDefinition = {
         type: 'boolean',
         description: 'Include field-level extraction diagnostics. Default: false',
       },
-      waitForReady: {
-        type: 'boolean',
-        description: 'Opt in to a bounded page-ready gate before extraction. Waits for document readiness and a short DOM mutation quiet window. Default: false',
-      },
-      readyTimeoutMs: {
-        type: 'number',
-        description: 'Maximum wait for waitForReady in milliseconds. Default: 5000',
-      },
     },
-    required: ['tabId', 'schema'],
+    required: ['tabId'],
   },
 };
 
@@ -79,25 +85,97 @@ function countFields(data: Record<string, unknown>): number {
   return Object.values(data).filter(v => v !== null && v !== undefined && v !== '').length;
 }
 
-export const extractDataHandler: ToolHandler = async (
+const handler: ToolHandler = async (
   sessionId: string,
   args: Record<string, unknown>,
   _context?: ToolContext
 ): Promise<MCPResult> => {
   const tabId = args.tabId as string;
-  const schema = args.schema as ExtractionSchema;
+  let schema = args.schema as ExtractionSchema | undefined;
+  const query = args.query as string | undefined;
   const selector = args.selector as string | undefined;
-  const multiple = (args.multiple as boolean) ?? false;
+  const mode = (args.mode as string | undefined) || 'fast';
+  let multiple = (args.multiple as boolean) ?? false;
   const debug = (args.debug as boolean) ?? false;
-  const waitForReady = (args.waitForReady as boolean) ?? false;
-  const readyTimeoutMs = args.readyTimeoutMs as number | undefined;
+  const startedAt = Date.now();
 
   if (!tabId) {
     return { content: [{ type: 'text', text: 'Error: tabId is required' }], isError: true };
   }
 
+  if (mode !== 'fast') {
+    return { content: [{ type: 'text', text: 'Error: Invalid mode. V1 extract_data query mode supports only mode="fast"; standard mode is tracked in #989.' }], isError: true };
+  }
+
+  if (schema && query) {
+    return { content: [{ type: 'text', text: 'Error: Provide either schema or query, not both.' }], isError: true };
+  }
+
+  let queryPlan: ReturnType<typeof buildExtractionQueryPlan> | null = null;
+  if (query) {
+    try {
+      queryPlan = buildExtractionQueryPlan(query);
+      schema = queryPlan.schema;
+      if (queryPlan.multiple) multiple = true;
+    } catch (error) {
+      const detail = error instanceof ExtractionQueryParseError ? error.message : String(error);
+      recordQueryDebug({
+        kind: 'extract',
+        sessionId,
+        tabId,
+        timestamp: new Date().toISOString(),
+        normalized: query,
+        modeUsed: mode,
+        strategies: [],
+        fieldsFound: [],
+        fieldsMissing: [],
+        durations: { totalMs: Math.max(0, Date.now() - startedAt) },
+        output: { chars: 0, truncated: false },
+        notes: [`parser failure: ${detail}`],
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: `Error: Invalid query — ${detail}. Example: { products[] { product_name product_price(number) product_url(url) } }`,
+        }],
+        isError: true,
+      };
+    }
+  }
+
+  if (!schema) {
+    recordQueryDebug({
+      kind: 'extract',
+      sessionId,
+      tabId,
+      timestamp: new Date().toISOString(),
+      modeUsed: mode,
+      strategies: [],
+      fieldsFound: [],
+      fieldsMissing: [],
+      durations: { totalMs: Math.max(0, Date.now() - startedAt) },
+      output: { chars: 0, truncated: false },
+      notes: ['schema/query missing'],
+    });
+    return { content: [{ type: 'text', text: 'Error: Either schema or query is required. Example query: { title price(number) }' }], isError: true };
+  }
+
   const schemaCheck = validateSchema(schema);
   if (!schemaCheck.valid) {
+    recordQueryDebug({
+      kind: 'extract',
+      sessionId,
+      tabId,
+      timestamp: new Date().toISOString(),
+      normalized: queryPlan?.normalizedQuery,
+      modeUsed: mode,
+      strategies: [],
+      fieldsFound: [],
+      fieldsMissing: [],
+      durations: { totalMs: Math.max(0, Date.now() - startedAt) },
+      output: { chars: 0, truncated: false },
+      notes: [`schema validation failure: ${schemaCheck.error}`],
+    });
     return { content: [{ type: 'text', text: `Error: Invalid schema — ${schemaCheck.error}` }], isError: true };
   }
 
@@ -112,35 +190,55 @@ export const extractDataHandler: ToolHandler = async (
   }
 
   try {
-    let readiness: PageReadyResult | undefined;
-    if (waitForReady) {
-      readiness = await waitForPageReady(page, { timeoutMs: readyTimeoutMs }, _context);
-    }
-
     const schemaProps: Record<string, SchemaProperty> = multiple
       ? (schema.items?.properties || schema.properties || {})
       : (schema.properties || {});
-    // Sanitize field names to prevent CSS selector injection in strategy builders
-    const safeFieldPattern = /^[a-zA-Z0-9_-]+$/;
-    const fieldNames = Object.keys(schemaProps).filter(f => safeFieldPattern.test(f));
+    // Keep schema keys intact in output; strategy builders sanitize only selector tokens.
+    const fieldNames = Object.keys(schemaProps);
 
     if (fieldNames.length === 0) {
       return { content: [{ type: 'text', text: 'Error: Schema must define at least one property' }], isError: true };
     }
 
+    const plan = buildExtractionPlan(schemaProps);
+    const fieldPlans = plan.fields.filter(f => fieldNames.includes(f.field));
+
     const pageUrl = page.url();
     const domain = extractDomainFromUrl(pageUrl);
 
+    const writeExtractDebug = (payload: { strategies: string[]; data?: Record<string, unknown>; fieldsFound?: string[]; fieldsMissing?: string[]; notes?: string[]; outputValue?: unknown }): void => {
+      const fieldsFound = payload.fieldsFound || Object.entries(payload.data || {})
+        .filter(([, v]) => v !== null && v !== undefined && v !== '')
+        .map(([k]) => k);
+      const fieldsMissing = payload.fieldsMissing || fieldNames.filter(f => !fieldsFound.includes(f));
+      const outputChars = JSON.stringify(payload.outputValue ?? payload.data ?? {}).length;
+      recordQueryDebug({
+        kind: 'extract',
+        sessionId,
+        tabId,
+        timestamp: new Date().toISOString(),
+        normalized: queryPlan?.normalizedQuery,
+        modeUsed: mode,
+        schemaSummary: { fields: fieldNames, multiple, ...(queryPlan?.rootListField ? { queryRoot: queryPlan.rootListField } : {}) },
+        strategies: payload.strategies,
+        fieldsFound,
+        fieldsMissing,
+        durations: { totalMs: Math.max(0, Date.now() - startedAt) },
+        output: { chars: outputChars, truncated: outputChars > 12000 },
+        notes: payload.notes,
+      });
+    };
+
     // Multiple items mode
     if (multiple) {
-      const multiScript = buildMultipleItemExtractor(fieldNames, schemaProps, selector);
+      const multiScript = buildMultipleItemExtractor(fieldPlans, schemaProps, selector);
       const rawItems = await withTimeout(page.evaluate(multiScript) as Promise<Record<string, unknown>[]>, 15000, 'extract_data');
 
       if (!Array.isArray(rawItems) || rawItems.length === 0) {
+        writeExtractDebug({ strategies: ['multiple-item'], fieldsFound: [], fieldsMissing: fieldNames, notes: ['no repeating items found'], outputValue: [] });
         return {
           content: [{ type: 'text', text: JSON.stringify({
-            action: 'extract_data', url: pageUrl, multiple: true, items: [], count: 0,
-            ...(readiness && { readiness }),
+            action: 'extract_data', url: pageUrl, multiple: true, ...(queryPlan ? { queryRoot: queryPlan.rootListField } : {}), items: [], count: 0,
             message: 'No repeating items found. Try a more specific selector or check if the page has loaded.',
           }) }],
         };
@@ -150,14 +248,22 @@ export const extractDataHandler: ToolHandler = async (
       const validated = rawItems.map(raw => validateAndCoerce(raw, itemSchema).result);
 
       const domainMemory = getDomainMemory();
-      domainMemory.record(domain, `extract:multiple:${fieldNames.sort().join(',')}`, JSON.stringify({
+      const memoryKey = queryPlan
+        ? `extract:multiple-query:${queryPlan.normalizedQuery}`
+        : `extract:multiple:${[...fieldNames].sort().join(',')}`;
+      domainMemory.record(domain, memoryKey, JSON.stringify({
         selector: selector || 'auto', fieldCount: fieldNames.length, itemCount: validated.length,
       }));
 
+      writeExtractDebug({
+        strategies: ['multiple-item'],
+        fieldsFound: fieldNames.filter(f => validated.some(item => item[f] !== null && item[f] !== undefined && item[f] !== '')),
+        outputValue: validated,
+      });
+
       return {
         content: [{ type: 'text', text: JSON.stringify({
-          action: 'extract_data', url: pageUrl, multiple: true, items: validated, count: validated.length,
-          ...(readiness && { readiness }),
+          action: 'extract_data', url: pageUrl, multiple: true, ...(queryPlan ? { queryRoot: queryPlan.rootListField } : {}), items: validated, count: validated.length,
         }) }],
       };
     }
@@ -165,43 +271,57 @@ export const extractDataHandler: ToolHandler = async (
     // Single item — layered strategies
     let merged: Record<string, unknown> = {};
     const strategies: string[] = [];
+    const fieldDiagnostics: Record<string, { resolvedVia?: string; aliasesTried: string[] }> = {};
+
+    function mergeWithDiagnostics(r: Record<string, unknown>, strategy: string): void {
+      const before = new Set(Object.entries(merged).filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k]) => k));
+      merged = mergeResults(merged, r);
+      for (const [field, value] of Object.entries(r)) {
+        if (value === null || value === undefined || value === '' || before.has(field)) continue;
+        const fp = fieldPlans.find(p => p.field === field);
+        fieldDiagnostics[field] = {
+          resolvedVia: strategy,
+          aliasesTried: fp?.aliases || [field],
+        };
+      }
+    }
 
     // Strategy 1: JSON-LD
     try {
-      const r = await withTimeout(page.evaluate(buildJsonLdExtractor(fieldNames)) as Promise<Record<string, unknown>>, 5000, 'extract_data:jsonld');
-      if (r && typeof r === 'object') { merged = mergeResults(merged, r); if (countFields(r) > 0) strategies.push('json-ld'); }
+      const r = await withTimeout(page.evaluate(buildJsonLdExtractor(fieldPlans)) as Promise<Record<string, unknown>>, 5000, 'extract_data:jsonld');
+      if (r && typeof r === 'object') { mergeWithDiagnostics(r, 'json-ld'); if (countFields(r) > 0) strategies.push('json-ld'); }
     } catch { /* non-fatal */ }
 
     if (countFields(merged) >= fieldNames.length) {
       const { result, validation } = validateAndCoerce(merged, schema);
-      return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, debug ? fieldDiagnostics : undefined, readiness);
+      return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, queryPlan?.normalizedQuery, debug ? fieldDiagnostics : undefined, writeExtractDebug);
     }
 
     // Strategy 2: Microdata
     try {
-      const r = await withTimeout(page.evaluate(buildMicrodataExtractor(fieldNames)) as Promise<Record<string, unknown>>, 5000, 'extract_data:microdata');
-      if (r && typeof r === 'object') { merged = mergeResults(merged, r); if (countFields(r) > 0) strategies.push('microdata'); }
+      const r = await withTimeout(page.evaluate(buildMicrodataExtractor(fieldPlans)) as Promise<Record<string, unknown>>, 5000, 'extract_data:microdata');
+      if (r && typeof r === 'object') { mergeWithDiagnostics(r, 'microdata'); if (countFields(r) > 0) strategies.push('microdata'); }
     } catch { /* non-fatal */ }
 
     // Strategy 3: OpenGraph
     try {
-      const r = await withTimeout(page.evaluate(buildOpenGraphExtractor(fieldNames)) as Promise<Record<string, unknown>>, 5000, 'extract_data:opengraph');
-      if (r && typeof r === 'object') { merged = mergeResults(merged, r); if (countFields(r) > 0) strategies.push('opengraph'); }
+      const r = await withTimeout(page.evaluate(buildOpenGraphExtractor(fieldPlans)) as Promise<Record<string, unknown>>, 5000, 'extract_data:opengraph');
+      if (r && typeof r === 'object') { mergeWithDiagnostics(r, 'opengraph'); if (countFields(r) > 0) strategies.push('opengraph'); }
     } catch { /* non-fatal */ }
 
     if (countFields(merged) >= fieldNames.length) {
       const { result, validation } = validateAndCoerce(merged, schema);
-      return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, debug ? fieldDiagnostics : undefined, readiness);
+      return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, queryPlan?.normalizedQuery, debug ? fieldDiagnostics : undefined, writeExtractDebug);
     }
 
     // Strategy 4: CSS heuristic
     try {
-      const r = await withTimeout(page.evaluate(buildCssHeuristicExtractor(fieldNames, schemaProps, selector)) as Promise<Record<string, unknown>>, 10000, 'extract_data:css');
-      if (r && typeof r === 'object') { merged = mergeResults(merged, r); if (countFields(r) > 0) strategies.push('css-heuristic'); }
+      const r = await withTimeout(page.evaluate(buildCssHeuristicExtractor(fieldPlans, schemaProps, selector)) as Promise<Record<string, unknown>>, 10000, 'extract_data:css');
+      if (r && typeof r === 'object') { mergeWithDiagnostics(r, 'css-heuristic'); if (countFields(r) > 0) strategies.push('css-heuristic'); }
     } catch { /* non-fatal */ }
 
     const { result, validation } = validateAndCoerce(merged, schema);
-    return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, debug ? fieldDiagnostics : undefined, readiness);
+    return buildResponse(result, validation.errors, pageUrl, strategies, domain, fieldNames, queryPlan?.normalizedQuery, debug ? fieldDiagnostics : undefined, writeExtractDebug);
   } catch (error) {
     return { content: [{ type: 'text', text: `Extraction error: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
   }
@@ -209,25 +329,30 @@ export const extractDataHandler: ToolHandler = async (
 
 function buildResponse(
   data: Record<string, unknown>, errors: string[], url: string,
-  strategies: string[], domain: string, fieldNames: string[],
+  strategies: string[], domain: string, fieldNames: string[], normalizedQuery?: string,
   fieldDiagnostics?: Record<string, { resolvedVia?: string; aliasesTried: string[] }>,
-  readiness?: PageReadyResult,
+  writeExtractDebug?: (payload: { strategies: string[]; data?: Record<string, unknown>; fieldsFound?: string[]; fieldsMissing?: string[]; notes?: string[]; outputValue?: unknown }) => void
 ): MCPResult {
   const fieldsFound = Object.entries(data).filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k]) => k);
   const fieldsMissing = fieldNames.filter(f => !fieldsFound.includes(f));
 
   if (fieldsFound.length > 0) {
     const dm = getDomainMemory();
-    dm.record(domain, `extract:single:${fieldNames.sort().join(',')}`, JSON.stringify({
+    const memoryKey = normalizedQuery
+      ? `extract:single-query:${normalizedQuery}`
+      : `extract:single:${[...fieldNames].sort().join(',')}`;
+    dm.record(domain, memoryKey, JSON.stringify({
       strategies, fieldsFound: fieldsFound.length, fieldsTotal: fieldNames.length,
     }));
   }
 
+  writeExtractDebug?.({ strategies, data, fieldsFound, fieldsMissing });
+
   const response: Record<string, unknown> = {
     action: 'extract_data', url, data, fieldsFound: fieldsFound.length, fieldsTotal: fieldNames.length, strategies,
   };
-  if (readiness) response.readiness = readiness;
   if (fieldsMissing.length > 0) response.fieldsMissing = fieldsMissing;
+  if (fieldDiagnostics) response.fieldDiagnostics = fieldDiagnostics;
   if (errors.length > 0) response.validationErrors = errors;
   if (fieldsFound.length === 0) {
     response.message = 'No data extracted. Try: (1) read_page to verify content, (2) provide a CSS selector, (3) wait_for before extracting.';
@@ -237,5 +362,5 @@ function buildResponse(
 }
 
 export function registerExtractDataTool(server: MCPServer): void {
-  server.registerTool('extract_data', extractDataHandler, definition);
+  server.registerTool('extract_data', handler, definition);
 }
