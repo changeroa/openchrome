@@ -559,6 +559,8 @@ export class CDPClient {
     }
     this.browser = null;
 
+    const generation = ++this.connectionGeneration;
+
     // Attempt reconnection — do NOT auto-launch Chrome.
     // If Chrome was closed by the user, we should stay disconnected and only
     // re-launch when the next tool call arrives (lazy launch). This prevents
@@ -581,7 +583,16 @@ export class CDPClient {
       });
 
       try {
-        await this.connectInternal({ autoLaunch: false });
+        const connected = await this.connectInternal({ autoLaunch: false, generation });
+        if (connected === false) {
+          this.reconnecting = false;
+          this.reconnectingAttempt = 0;
+          this.reconnectNextRetryAt = 0;
+          if (this.connectionState === 'reconnecting') {
+            this.connectionState = 'disconnected';
+          }
+          return;
+        }
         console.error('[CDPClient] Reconnection successful');
         this.reconnectAttempts = 0;
         this.reconnecting = false;
@@ -1011,6 +1022,9 @@ export class CDPClient {
       }
       this.lastVerifiedAt = Date.now();
       this.consecutiveHeartbeatFailures = 0;
+      this.reconnecting = false;
+      this.reconnectingAttempt = 0;
+      this.reconnectNextRetryAt = 0;
       this.startHeartbeat();
       this.emitConnectionEvent({ type: 'reconnected', timestamp: Date.now() });
       console.error('[CDPClient] Reconnected to Chrome');
