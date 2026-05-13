@@ -303,10 +303,10 @@ async function headedAutoRetry(
         // Get the live Page object from HeadedFallbackManager and register it
         const page = headedFallback.getPage(result.targetId);
         if (page) {
-          sessionManager.registerHeadedPage(result.targetId, sessionId, resolvedWorkerId, page);
+          await sessionManager.registerHeadedPage(result.targetId, sessionId, resolvedWorkerId, page);
         } else {
           // Fallback: register without page injection (navigation-only, no tool access)
-          sessionManager.registerExternalTarget(result.targetId, sessionId, resolvedWorkerId);
+          await sessionManager.registerExternalTarget(result.targetId, sessionId, resolvedWorkerId);
         }
 
         tabId = result.targetId;
@@ -378,9 +378,9 @@ async function headedNavigateDirect(
 
         const page = headedFallback.getPage(result.targetId);
         if (page) {
-          sessionManager.registerHeadedPage(result.targetId, sessionId, resolvedWorkerId, page);
+          await sessionManager.registerHeadedPage(result.targetId, sessionId, resolvedWorkerId, page);
         } else {
-          sessionManager.registerExternalTarget(result.targetId, sessionId, resolvedWorkerId);
+          await sessionManager.registerExternalTarget(result.targetId, sessionId, resolvedWorkerId);
         }
 
         tabId = result.targetId;
