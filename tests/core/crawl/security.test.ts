@@ -377,6 +377,23 @@ describe('crawl review follow-ups', () => {
     expect(raw.split('\n')[0]).toContain('token=[REDACTED]');
   });
 
+  test('signed start URLs are dequeued by key after their redacted fetched event', async () => {
+    mkTmpRoot();
+    server = await startFixtureServer([{ name: 'signed', links: [] }]);
+    bootTools();
+    const spy: SpyState = { calls: [] };
+    _setAdvanceOptionsForTests({ fetcher: makeSpyFetcher(spy) });
+
+    const signedUrl = `${server.url('signed')}?token=secret123`;
+    const startBody = parseResult(
+      await crawlStart!('s', { url: signedUrl, max_pages: 2, max_depth: 0 }),
+    );
+    await crawlStatus!('s', { jobId: startBody.jobId, advance: 2 });
+
+    expect(spy.calls.map((c) => c.url)).toEqual([signedUrl]);
+    expect(loadJob(startBody.jobId as string).queue).toHaveLength(0);
+  });
+
   test('same-process jobs fetch original signed discovered URLs while persisting redacted queue entries', async () => {
     mkTmpRoot();
     server = await startFixtureServer({

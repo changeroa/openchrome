@@ -211,7 +211,12 @@ export async function advanceJob(
     const fresh = loadJob(jobId);
     if (fresh.pages.length === 0 && fresh.queue.length === 0) {
       const startUrl = getOriginalStartUrl(jobId) ?? fresh.config.url;
-      const seed: QueueEntry = { url: normalizeUrl(startUrl), depth: 0 };
+      const normalizedStart = normalizeUrl(startUrl);
+      const seed: QueueEntry = {
+        url: normalizedStart,
+        depth: 0,
+        key: queueEntryKey(normalizedStart),
+      };
       appendEventUnlocked(jobId, { kind: 'enqueue', urls: [seed], t: Date.now() });
     }
     // Promote to running. Status events are deduplicated by the replay
@@ -253,7 +258,7 @@ export async function advanceJob(
     // `crawl_cancel` can promote the status while we wait.
     const pageOutcome = await withJobLock(jobId, async (): Promise<'continue' | 'break'> => {
       const fresh = loadJob(jobId);
-      if (fresh.status === 'cancelled' || fresh.status === 'completed') {
+      if (fresh.status === 'cancelled' || fresh.status === 'completed' || fresh.status === 'expired') {
         return 'break';
       }
       // Rebuild the BFS tracker from the persisted state — it might have
