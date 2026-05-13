@@ -1,7 +1,7 @@
 /// <reference types="jest" />
 
 import { getMetricsCollector } from '../../src/metrics/collector';
-import { estimateOutputTokensFromChars, extractCacheStatus } from '../../src/mcp-server';
+import { MCPServer, estimateOutputTokensFromChars, extractCacheStatus } from '../../src/mcp-server';
 
 describe('tool output observability metrics', () => {
   afterEach(() => {
@@ -35,6 +35,23 @@ describe('tool output observability metrics', () => {
     expect(dump).not.toContain('https://');
     expect(dump).not.toContain('selector=');
     expect(dump).not.toContain('instruction=');
+  });
+
+
+  test('buckets unregistered tool names before recording output metrics', () => {
+    const server = new MCPServer();
+    const attackerTool = `attacker-${Date.now()}-${Math.random()}`;
+
+    (server as unknown as {
+      recordToolOutputObservability: (toolName: string, result: { content: Array<{ type: 'text'; text: string }>; isError?: boolean }) => void;
+    }).recordToolOutputObservability(attackerTool, {
+      content: [{ type: 'text', text: 'Forbidden' }],
+      isError: true,
+    });
+
+    const dump = getMetricsCollector().export();
+    expect(dump).toContain('openchrome_tool_output_bytes_bucket{tool="unknown"');
+    expect(dump).not.toContain(attackerTool);
   });
 
   test('estimates tokens from characters rather than UTF-8 bytes', () => {

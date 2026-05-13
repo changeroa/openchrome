@@ -2055,13 +2055,18 @@ export class MCPServer {
   }
 
 
+  private getObservedToolMetricLabel(toolName: string): string {
+    return this.tools.has(toolName) || toolName === 'expand_tools' ? toolName : 'unknown';
+  }
+
   private recordToolOutputObservability(toolName: string, result: MCPResult): void {
     try {
       const metrics = getMetricsCollector();
+      const observedToolName = this.getObservedToolMetricLabel(toolName);
       const payload = stringifyResultPayload(result);
       const bytes = Buffer.byteLength(payload, 'utf8');
-      metrics.observe('openchrome_tool_output_bytes', withTenantLabel({ tool: toolName }), bytes);
-      metrics.observe('openchrome_tool_estimated_tokens', withTenantLabel({ tool: toolName }), estimateOutputTokensFromChars(payload.length));
+      metrics.observe('openchrome_tool_output_bytes', withTenantLabel({ tool: observedToolName }), bytes);
+      metrics.observe('openchrome_tool_estimated_tokens', withTenantLabel({ tool: observedToolName }), estimateOutputTokensFromChars(payload.length));
 
       const compression = (result as Record<string, unknown>)._compression;
       if (compression && typeof compression === 'object') {
@@ -2071,7 +2076,7 @@ export class MCPServer {
         if (typeof originalChars === 'number' && typeof compressedChars === 'number' && originalChars > compressedChars) {
           metrics.observe(
             'openchrome_tool_compression_saved_bytes',
-            withTenantLabel({ tool: toolName, mode: level }),
+            withTenantLabel({ tool: observedToolName, mode: level }),
             originalChars - compressedChars,
           );
         }
@@ -2080,7 +2085,7 @@ export class MCPServer {
       const cache = extractCacheStatus(result);
       if (cache) {
         metrics.inc('openchrome_cache_status_total', withTenantLabel({
-          tool: toolName,
+          tool: observedToolName,
           status: cache.status,
           key_version: cache.keyVersion,
         }));
