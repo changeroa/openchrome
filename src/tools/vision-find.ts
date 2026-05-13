@@ -13,8 +13,10 @@ import { MCPToolDefinition, MCPResult, ToolHandler, ToolContext, hasBudget } fro
 import { getSessionManager } from '../session-manager';
 import { formatElementMapAsText } from '../vision/screenshot-analyzer';
 import { formatPerceptionSnapshotAsText } from '../vision/perception-provider';
+import type { AnnotatedScreenshotResult, PerceptionSnapshot } from '../vision/types';
 import { DomAnnotatorPerceptionProvider } from '../vision/providers/dom-annotator-provider';
-import { trackVisionUsage } from '../vision/config';
+import { OmniParserHttpProvider } from '../vision/providers/omniparser-http-provider';
+import { getOmniParserProviderConfig, trackVisionUsage } from '../vision/config';
 
 const definition: MCPToolDefinition = {
   name: 'vision_find',
@@ -130,21 +132,54 @@ const handler: ToolHandler = async (
     const modeArg = args.mode;
     const mode: 'viewport' | 'tiled' = modeArg === 'tiled' ? 'tiled' : 'viewport';
 
-    const provider = new DomAnnotatorPerceptionProvider(page);
-    const { result, snapshot } = await provider.captureAnnotated(tabId, page.url(), {
-      showGrid,
-      showBoundingBoxes,
-      interactiveOnly,
-      occlusionFilter,
-      iframes,
-      mode,
-    });
+    const domProvider = new DomAnnotatorPerceptionProvider(page);
+    const providerConfig = getOmniParserProviderConfig();
+    const wantsSnapshot = format === 'snapshot' || format === 'both';
+    const needsDomResult = format === 'legacy' || format === 'both' || includeImage;
+    let result: AnnotatedScreenshotResult | undefined;
+    let snapshot: PerceptionSnapshot | undefined;
+    const fallbackWarnings: string[] = [];
 
-    trackVisionUsage(result.annotationTimeMs);
-    const textMap = formatElementMapAsText(result.elementMap);
-    console.error(`[vision_find] Analyzed tab ${tabId}: ${result.elementCount} elements in ${result.annotationTimeMs}ms`);
+    if (wantsSnapshot && providerConfig.provider === 'omniparser-http') {
+      if (!providerConfig.endpointUrl) {
+        fallbackWarnings.push('OmniParser HTTP provider requested but OPENCHROME_OMNIPARSER_URL is not set; using dom-annotator fallback.');
+      } else {
+        try {
+          const provider = new OmniParserHttpProvider(page, {
+            endpointUrl: providerConfig.endpointUrl,
+            timeoutMs: providerConfig.timeoutMs,
+            maxElements: providerConfig.maxElements,
+            context,
+          });
+          snapshot = await provider.capture(tabId, page.url());
+          trackVisionUsage(snapshot.latencyMs);
+        } catch (error) {
+          fallbackWarnings.push(`OmniParser HTTP provider failed: ${error instanceof Error ? error.message : String(error)}; using dom-annotator fallback.`);
+        }
+      }
+    }
 
-    const tiles = mode === 'tiled' ? (result.tiling?.tiles ?? []) : [];
+    if (needsDomResult || !snapshot) {
+      const captured = await domProvider.captureAnnotated(tabId, page.url(), {
+        showGrid,
+        showBoundingBoxes,
+        interactiveOnly,
+        occlusionFilter,
+        iframes,
+        mode,
+      });
+      result = captured.result;
+      if (!snapshot) snapshot = captured.snapshot;
+      if (fallbackWarnings.length > 0) {
+        snapshot.warnings.unshift(...fallbackWarnings);
+      }
+      trackVisionUsage(result.annotationTimeMs);
+      console.error(`[vision_find] Analyzed tab ${tabId}: ${result.elementCount} DOM elements in ${result.annotationTimeMs}ms`);
+    } else {
+      console.error(`[vision_find] Analyzed tab ${tabId}: ${snapshot.elements.length} ${snapshot.provider} elements in ${snapshot.latencyMs}ms`);
+    }
+
+    const tiles = mode === 'tiled' ? (result?.tiling?.tiles ?? []) : [];
     const tileNote =
       mode === 'tiled' && tiles.length > 0
         ? `
@@ -154,10 +189,21 @@ Tiled mode: ${tiles.length} tile screenshot(s) attached below in document-Y orde
     const imageBlocks =
       tiles.length > 0
         ? tiles.map((t) => ({ type: 'image' as const, data: t.imageBase64, mimeType: t.mimeType }))
-        : [{ type: 'image' as const, data: result.screenshot, mimeType: result.mimeType }];
+        : result
+          ? [{ type: 'image' as const, data: result.screenshot, mimeType: result.mimeType }]
+          : [];
 
     const content: MCPResult['content'] = [];
     if (format === 'legacy' || format === 'both') {
+      if (!result) {
+        const captured = await domProvider.captureAnnotated(tabId, page.url(), {
+          showGrid,
+          showBoundingBoxes,
+          interactiveOnly,
+        });
+        result = captured.result;
+      }
+      const textMap = formatElementMapAsText(result.elementMap);
       content.push({
         type: 'text',
         text: `Vision analysis: ${result.elementCount} elements found (${result.viewport.width}x${result.viewport.height} viewport, ${result.annotationTimeMs}ms)${tileNote}
@@ -165,7 +211,7 @@ Tiled mode: ${tiles.length} tile screenshot(s) attached below in document-Y orde
 ${textMap}`,
       });
     }
-    if (format === 'snapshot' || format === 'both') {
+    if (wantsSnapshot) {
       content.push({
         type: 'text',
         text: formatPerceptionSnapshotAsText(snapshot),
