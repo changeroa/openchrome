@@ -18,6 +18,22 @@
  * `meta.path_taken` to learn which backend served the call and decides
  * what to do with it (token-cost optimization, retry policy, evidence
  * enrichment). No threshold is encoded in the helper.
+ *
+ * Known exemptions (tools that do NOT surface `meta.path_taken`):
+ *
+ *   - `crawl_start`: host-driven async tool that does not route through
+ *     BrowserRouter. The router-decision facts for each crawled page
+ *     belong inside the worker's per-page records and on tool calls that
+ *     consume the resulting pages.
+ *   - `crawl_status`: reads job state from the persisted job-store; it
+ *     does not route any tab through BrowserRouter. Per-page facts are
+ *     captured inside the worker, not surfaced on the status reader.
+ *   - `find`: routes through BrowserRouter (sessionManager.getPage runs
+ *     with toolName='find'), but the response shape is a human-readable
+ *     text envelope without a structured payload. Promoting `find` to
+ *     emit `structuredContent` is a separate breaking-shape PR; for v1
+ *     the host reads `meta.path_taken` from a subsequent router-routed
+ *     tool call (read_page, extract_data, navigate) on the same tab.
  */
 
 import type { SessionManager } from '../../session-manager';
