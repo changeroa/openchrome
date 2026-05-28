@@ -10,6 +10,7 @@
  */
 import type { EvalContext } from '../eval-context';
 import type { EvaluationResult, ImageQaAssertion } from '../types';
+import { compileSafeRegex } from '../safe-regex';
 
 export async function evaluateImageQa(
   assertion: ImageQaAssertion,
@@ -66,7 +67,10 @@ export async function evaluateImageQa(
 
   let regex: RegExp;
   try {
-    regex = new RegExp(assertion.expected_pattern);
+    // Re-run the safe-regex guard at evaluation time too: keeps the hot
+    // path consistent with every other src/contracts evaluator and
+    // defends against a pattern that reached here without validation.
+    regex = compileSafeRegex(assertion.expected_pattern);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return {
