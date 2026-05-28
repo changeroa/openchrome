@@ -87,4 +87,55 @@ describe('runOnlineMind2WebTask', () => {
     expect(r.passed).toBe(true);
     expect(r.reason).toBe('custom');
   });
+
+  it('returns a structured failure when a step throws', async () => {
+    const deps: RunnerDeps = {
+      step: async (_t, i) => {
+        if (i === 3) throw new Error('CDP crashed');
+        return fakeStep(i, 'navigate');
+      },
+      judge: fakeSentinelJudge(),
+    };
+    const r = await runOnlineMind2WebTask(fakeTask(), deps, { step_budget: 50 });
+    expect(r.passed).toBe(false);
+    expect(r.steps_used).toBe(2); // two steps captured before the throw
+    expect(r.reason).toMatch(/step 3 threw: CDP crashed/);
+    expect(r.judge_id).toBe('fake-sentinel');
+  });
+
+  it('collapses a non-finite step_budget (Infinity) to the default', async () => {
+    let calls = 0;
+    const deps: RunnerDeps = {
+      step: async (_t, i) => {
+        calls++;
+        return fakeStep(i, 'navigate');
+      },
+      judge: fakeSentinelJudge(),
+    };
+    const r = await runOnlineMind2WebTask(fakeTask(), deps, {
+      step_budget: Number.POSITIVE_INFINITY,
+    });
+    expect(r.steps_used).toBe(100);
+    expect(calls).toBe(100);
+  });
+
+  it('collapses a fractional sub-1 step_budget to the default', async () => {
+    const deps: RunnerDeps = {
+      step: async (_t, i) => fakeStep(i, 'navigate'),
+      judge: fakeSentinelJudge(),
+    };
+    const r = await runOnlineMind2WebTask(fakeTask(), deps, { step_budget: 0.5 });
+    expect(r.steps_used).toBe(100);
+  });
+
+  it('runs zero steps when shouldStop is true on the first call', async () => {
+    const deps: RunnerDeps = {
+      step: async (_t, i) => fakeStep(i, 'navigate'),
+      shouldStop: () => true,
+      judge: fakeSentinelJudge(),
+    };
+    const r = await runOnlineMind2WebTask(fakeTask(), deps, { step_budget: 50 });
+    expect(r.steps_used).toBe(0);
+    expect(r.passed).toBe(false);
+  });
 });

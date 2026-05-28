@@ -40,7 +40,11 @@ export interface JudgeVerdict {
 export interface RunnerDeps {
   /** Plan and execute one step. Returns the captured tool call. */
   step(task: OnlineMind2WebTask, stepIndex: number, history: RunnerStep[]): Promise<RunnerStep>;
-  /** Optional early-stop hook (#1428 Part 2 will eventually wire this). */
+  /**
+   * Optional caller-supplied early-stop predicate. Called before each step
+   * with the evidence accumulated so far (an empty array on the first
+   * iteration), so a `true` on entry stops the run before any step executes.
+   */
   shouldStop?(history: RunnerStep[]): boolean;
   /** Decide whether the task is complete (model-backed in prod). */
   judge(task: OnlineMind2WebTask, evidence: RunnerStep[]): Promise<JudgeVerdict>;
@@ -66,15 +70,35 @@ export async function runOnlineMind2WebTask(
   deps: RunnerDeps,
   options: RunnerOptions = {},
 ): Promise<RunnerResult> {
+  // Floor before the guard so Infinity, NaN, fractional, and non-positive
+  // budgets all collapse to the published default instead of producing an
+  // infinite loop (Infinity) or a zero-step no-op (0.5 → 0).
+  const flooredBudget = Math.floor(options.step_budget ?? Number.NaN);
   const budget =
-    typeof options.step_budget === 'number' && options.step_budget > 0
-      ? Math.floor(options.step_budget)
+    Number.isFinite(flooredBudget) && flooredBudget > 0
+      ? flooredBudget
       : DEFAULT_STEP_BUDGET;
 
   const evidence: RunnerStep[] = [];
   for (let i = 1; i <= budget; i++) {
     if (deps.shouldStop?.(evidence)) break;
-    const step = await deps.step(task, i, evidence);
+    let step: RunnerStep;
+    try {
+      step = await deps.step(task, i, evidence);
+    } catch (err) {
+      // A thrown step is a hard failure, not a runner crash. Let the judge
+      // rule on the partial evidence and return a structured result so a
+      // batch harness sees one failed task rather than a rejected promise.
+      const verdict = await deps.judge(task, evidence);
+      return {
+        task_id: task.task_id,
+        passed: false,
+        steps_used: evidence.length,
+        reason: `step ${i} threw: ${err instanceof Error ? err.message : String(err)}`,
+        ...(verdict.judge_id !== undefined ? { judge_id: verdict.judge_id } : {}),
+        evidence,
+      };
+    }
     evidence.push(step);
     if (!step.ok) {
       // Stop on the first hard failure; the judge can still rule on
@@ -89,7 +113,7 @@ export async function runOnlineMind2WebTask(
     passed: verdict.passed,
     steps_used: evidence.length,
     reason: verdict.reason,
-    ...(verdict.judge_id ? { judge_id: verdict.judge_id } : {}),
+    ...(verdict.judge_id !== undefined ? { judge_id: verdict.judge_id } : {}),
     evidence,
   };
 }
